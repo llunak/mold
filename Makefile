@@ -18,6 +18,10 @@ ifeq ($(origin CXX), default)
   CXX = c++
 endif
 
+# ! edit !
+SMALL=1
+CXX=g++-11
+
 # If you want to keep symbols in the installed binary, run make with
 # `STRIP=true` to run /bin/true instead of the strip command.
 STRIP = strip
@@ -47,6 +51,13 @@ MOLD_LDFLAGS := -pthread -lz -lm -ldl
 GIT_HASH := $(shell [ -d .git ] && git rev-parse HEAD)
 ifneq ($(GIT_HASH),)
   MOLD_CXXFLAGS += -DGIT_HASH=\"$(GIT_HASH)\"
+endif
+
+# ! edit !
+SMALL = 1
+ifeq ($(SMALL), 1)
+MOLD_CXXFLAGS += -DMOLD_DEBUG_X86_64_ONLY -ffunction-sections -fdata-sections
+MOLD_LDFLAGS += -Wl,--gc-sections
 endif
 
 LTO = 0
