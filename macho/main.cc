@@ -269,14 +269,25 @@ MappedFile<Context<E>> *find_framework(Context<E> &ctx, std::string name) {
 
 template <typename E>
 MappedFile<Context<E>> *find_library(Context<E> &ctx, std::string name) {
-  for (std::string dir : ctx.arg.library_paths) {
-    for (std::string ext : {".tbd", ".dylib", ".a"}) {
-      std::string path = dir + "/lib" + name + ext;
-      if (MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path))
-        return mf;
+  auto search = [&](std::vector<std::string> extn) -> MappedFile<Context<E>> * {
+    for (std::string dir : ctx.arg.library_paths) {
+      for (std::string e : extn) {
+        std::string path = dir + "/lib" + name + e;
+        if (MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path))
+          return mf;
+      }
     }
-  }
-  return nullptr;
+    return nullptr;
+  };
+
+  // -search_paths_first
+  if (ctx.arg.search_paths_first)
+    return search({".tbd", ".dylib", ".a"});
+
+  // -search_dylibs_first
+  if (MappedFile<Context<E>> *mf = search({".tbd", ".dylib"}))
+    return mf;
+  return search({".a"});
 }
 
 template <typename E>
@@ -293,8 +304,7 @@ strip_universal_header(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 }
 
 template <typename E>
-static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf,
-                      bool is_needed = false) {
+static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   if (get_file_type(mf) == FileType::MACH_UNIVERSAL)
     mf = strip_universal_header(ctx, mf);
 
@@ -302,8 +312,6 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf,
   case FileType::TAPI:
   case FileType::MACH_DYLIB:
     ctx.dylibs.push_back(DylibFile<E>::create(ctx, mf));
-    if (is_needed || !ctx.arg.dead_strip_dylibs)
-      ctx.dylibs.back()->is_needed = true;
     break;
   case FileType::MACH_OBJ:
     ctx.objs.push_back(ObjectFile<E>::create(ctx, mf, ""));
@@ -347,6 +355,13 @@ read_filelist(Context<E> &ctx, std::string arg) {
 
 template <typename E>
 static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
+  auto must_find_library = [&](std::string arg) {
+    MappedFile<Context<E>> *mf = find_library(ctx, arg);
+    if (!mf)
+      Fatal(ctx) << "library not found: -l" << arg;
+    return mf;
+  };
+
   while (!args.empty()) {
     const std::string &arg = args[0];
     args = args.subspan(1);
@@ -369,14 +384,26 @@ static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
       read_file(ctx, MappedFile<Context<E>>::must_open(ctx, args[0]));
       ctx.all_load = orig;
       args = args.subspan(1);
-    } else if (arg == "-framework" || arg == "-needed_framework") {
-      read_file(ctx, find_framework(ctx, args[0]), arg == "-needed_framework");
+    } else if (arg == "-framework") {
+      read_file(ctx, find_framework(ctx, args[0]));
       args = args.subspan(1);
-    } else if (arg == "-l" || arg == "-needed-l") {
-      MappedFile<Context<E>> *mf = find_library(ctx, args[0]);
-      if (!mf)
-        Fatal(ctx) << "library not found: -l" << args[0];
-      read_file(ctx, mf, arg == "-needed-l");
+    } else if (arg == "-needed_framework") {
+      ctx.needed_l = true;
+      read_file(ctx, find_framework(ctx, args[0]));
+      ctx.needed_l = false;
+      args = args.subspan(1);
+    } else if (arg == "-l") {
+      read_file(ctx, must_find_library(args[0]));
+      args = args.subspan(1);
+    } else if (arg == "-needed-l") {
+      ctx.needed_l = true;
+      read_file(ctx, must_find_library(args[0]));
+      ctx.needed_l = false;
+      args = args.subspan(1);
+    } else if (arg == "-hidden-l") {
+      ctx.hidden_l = true;
+      read_file(ctx, must_find_library(args[0]));
+      ctx.hidden_l = false;
       args = args.subspan(1);
     } else {
       read_file(ctx, MappedFile<Context<E>>::must_open(ctx, arg));
@@ -505,6 +532,9 @@ static int do_main(int argc, char **argv) {
 
   ctx.output_file = OutputFile<E>::open(ctx, ctx.arg.output, output_size, 0777);
   ctx.buf = ctx.output_file->buf;
+
+  if (ctx.arg.uuid != UUID_NONE)
+    ctx.mach_hdr.write_uuid(ctx);
 
   for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
     seg->copy_buf(ctx);

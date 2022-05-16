@@ -2,7 +2,6 @@
 #include "../sha.h"
 
 #include <cctype>
-#include <random>
 #include <shared_mutex>
 #include <sys/mman.h>
 #include <tbb/parallel_for_each.h>
@@ -30,11 +29,6 @@ static u32 djb_hash(std::string_view name) {
   for (u8 c : name)
     h = (h << 5) + h + c;
   return h;
-}
-
-template <typename E>
-void Chunk<E>::write_to(Context<E> &ctx, u8 *buf) {
-  Fatal(ctx) << name << ": write_to is called on an invalid section";
 }
 
 template <typename E>
@@ -121,10 +115,12 @@ static i64 to_phdr_flags(Context<E> &ctx, Chunk<E> *chunk) {
     return PF_R | PF_W | PF_X;
 
   i64 ret = PF_R;
-  if (chunk->shdr.sh_flags & SHF_WRITE)
+  bool write = (chunk->shdr.sh_flags & SHF_WRITE);
+  if (write)
     ret |= PF_W;
-  if ((chunk->shdr.sh_flags & SHF_EXECINSTR) ||
-      (ctx.arg.z_separate_code == NOSEPARATE_CODE))
+  if ((ctx.arg.z_separate_code == NOSEPARATE_CODE) ||
+      (!ctx.arg.rosegment && !write) ||
+      (chunk->shdr.sh_flags & SHF_EXECINSTR))
     ret |= PF_X;
   return ret;
 }
@@ -149,12 +145,11 @@ bool is_relro(Context<E> &ctx, Chunk<E> *chunk) {
   u64 type = chunk->shdr.sh_type;
 
   if (flags & SHF_WRITE)
-    if ((flags & SHF_TLS) || type == SHT_INIT_ARRAY ||
-        type == SHT_FINI_ARRAY || type == SHT_PREINIT_ARRAY ||
-        chunk == ctx.got.get() || chunk == ctx.dynamic.get() ||
-        (ctx.arg.z_now && chunk == ctx.gotplt.get()) ||
-        chunk->name.ends_with(".rel.ro"))
-      return true;
+    return (flags & SHF_TLS) || type == SHT_INIT_ARRAY ||
+           type == SHT_FINI_ARRAY || type == SHT_PREINIT_ARRAY ||
+           chunk == ctx.got.get() || chunk == ctx.dynamic.get() ||
+           (ctx.arg.z_now && chunk == ctx.gotplt.get()) ||
+           chunk->name.ends_with(".rel.ro");
   return false;
 }
 
@@ -751,28 +746,27 @@ static std::string_view get_output_name(Context<E> &ctx, std::string_view name) 
   if (ctx.arg.unique && ctx.arg.unique->match(name))
     return name;
 
+  if (name.starts_with(".rodata.cst"))
+    return ".rodata.cst";
+  if (name.starts_with(".rodata.str"))
+    return ".rodata.str";
+  if (name.starts_with(".ARM.exidx"))
+    return ".ARM.exidx";
+  if (name.starts_with(".ARM.extab"))
+    return ".ARM.extab";
+
   if (ctx.arg.z_keep_text_section_prefix) {
-    static std::string_view text_prefixes[] = {
+    static std::string_view prefixes[] = {
       ".text.hot.", ".text.unknown.", ".text.unlikely.", ".text.startup.",
       ".text.exit."
     };
 
-    for (std::string_view prefix : text_prefixes) {
+    for (std::string_view prefix : prefixes) {
       std::string_view stem = prefix.substr(0, prefix.size() - 1);
       if (name == stem || name.starts_with(prefix))
         return stem;
     }
   }
-
-  if (name.starts_with( ".rodata.cst"))
-    return ".rodata.cst";
-  if (name.starts_with( ".rodata.str"))
-    return ".rodata.str";
-
-  if (name.starts_with(".ARM.exidx"))
-    return ".ARM.exidx";
-  if (name.starts_with(".ARM.extab"))
-    return ".ARM.extab";
 
   static std::string_view prefixes[] = {
     ".text.", ".data.rel.ro.", ".data.", ".rodata.", ".bss.rel.ro.", ".bss.",
@@ -814,7 +808,8 @@ OutputSection<E>::get_instance(Context<E> &ctx, std::string_view name,
                                u64 type, u64 flags) {
   name = get_output_name(ctx, name);
   type = canonicalize_type<E>(name, type);
-  flags = flags & ~(u64)SHF_GROUP & ~(u64)SHF_COMPRESSED & ~(u64)SHF_LINK_ORDER;
+  flags = flags & ~(u64)SHF_GROUP & ~(u64)SHF_COMPRESSED & ~(u64)SHF_LINK_ORDER &
+          ~(u64)SHF_GNU_RETAIN;
 
   // .init_array is usually writable. We don't want to create multiple
   // .init_array output sections, so make it always writable.
@@ -2004,21 +1999,6 @@ static void compute_sha256(Context<E> &ctx, i64 offset) {
   }
 }
 
-static std::vector<u8> get_uuid_v4() {
-  std::random_device rand;
-  u32 buf[4] = { rand(), rand(), rand(), rand() };
-  std::vector<u8> bytes{(u8 *)buf, (u8 *)buf + 16};
-
-  // Indicate that this is UUIDv4.
-  bytes[6] &= 0b00001111;
-  bytes[6] |= 0b01000000;
-
-  // Indicates that this is an RFC4122 variant.
-  bytes[8] &= 0b00111111;
-  bytes[8] |= 0b10000000;
-  return bytes;
-}
-
 template <typename E>
 void BuildIdSection<E>::write_buildid(Context<E> &ctx) {
   Timer t(ctx, "build_id");
@@ -2035,9 +2015,11 @@ void BuildIdSection<E>::write_buildid(Context<E> &ctx) {
     // requested.
     compute_sha256(ctx, this->shdr.sh_offset + HEADER_SIZE);
     return;
-  case BuildId::UUID:
-    write_vector(ctx.buf + this->shdr.sh_offset + HEADER_SIZE, get_uuid_v4());
+  case BuildId::UUID: {
+    std::array<u8, 16> uuid = get_uuid_v4();
+    memcpy(ctx.buf + this->shdr.sh_offset + HEADER_SIZE, uuid.data(), 16);
     return;
+  }
   default:
     unreachable();
   }
@@ -2125,6 +2107,8 @@ template <typename E>
 void GdbIndexSection<E>::construct(Context<E> &ctx) {
   Timer t(ctx, "GdbIndexSection::construct");
 
+  std::atomic_bool has_debug_info = false;
+
   // Read debug sections
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     if (file->debug_info) {
@@ -2133,8 +2117,12 @@ void GdbIndexSection<E>::construct(Context<E> &ctx) {
 
       // Count the number of address areas contained in this file.
       file->num_areas = estimate_address_areas(ctx, *file);
+      has_debug_info = true;
     }
   });
+
+  if (!has_debug_info)
+    return;
 
   // Initialize `area_offset` and `compunits_idx`.
   for (i64 i = 0; i < ctx.objs.size() - 1; i++) {
@@ -2325,6 +2313,10 @@ void GdbIndexSection<E>::copy_buf(Context<E> &ctx) {
 template <typename E>
 void GdbIndexSection<E>::write_address_areas(Context<E> &ctx) {
   Timer t(ctx, "GdbIndexSection::write_address_areas");
+
+  if (this->shdr.sh_size == 0)
+    return;
+
   u8 *base = ctx.buf + this->shdr.sh_offset;
 
   for (Chunk<E> *chunk : ctx.chunks) {

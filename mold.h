@@ -2,6 +2,7 @@
 
 #include "inttypes.h"
 
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cassert>
@@ -279,6 +280,10 @@ inline u64 read_uleb(u8 *&buf) {
   return val;
 }
 
+inline u64 read_uleb(u8 const*&buf) {
+  return read_uleb(const_cast<u8 *&>(buf));
+}
+
 inline i64 uleb_size(u64 val) {
   i64 i = 0;
   do {
@@ -421,6 +426,12 @@ private:
 
   std::vector<std::atomic_uint8_t> buckets;
 };
+
+//
+// uuid.cc
+//
+
+std::array<u8, 16> get_uuid_v4();
 
 //
 // filepath.cc

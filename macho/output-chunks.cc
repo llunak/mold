@@ -106,6 +106,9 @@ static std::vector<u8> create_uuid_cmd(Context<E> &ctx) {
 
   cmd.cmd = LC_UUID;
   cmd.cmdsize = buf.size();
+
+  assert(sizeof(cmd.uuid) == sizeof(ctx.uuid));
+  memcpy(cmd.uuid, ctx.uuid, sizeof(cmd.uuid));
   return buf;
 }
 
@@ -146,6 +149,7 @@ static std::vector<u8> create_main_cmd(Context<E> &ctx) {
   cmd.cmdsize = buf.size();
   cmd.entryoff = get_symbol(ctx, ctx.arg.entry)->get_addr(ctx) -
                  ctx.arg.pagezero_size;
+  cmd.stacksize = ctx.arg.stack_size;
   return buf;
 }
 
@@ -205,13 +209,13 @@ static std::vector<u8> create_data_in_code_cmd(Context<E> &ctx) {
 
 template <typename E>
 static std::vector<u8> create_id_dylib_cmd(Context<E> &ctx) {
-  std::vector<u8> buf(sizeof(DylibCommand) + ctx.arg.output.size() + 1);
+  std::vector<u8> buf(sizeof(DylibCommand) + ctx.arg.final_output.size() + 1);
   DylibCommand &cmd = *(DylibCommand *)buf.data();
 
   cmd.cmd = LC_ID_DYLIB;
   cmd.cmdsize = buf.size();
   cmd.nameoff = sizeof(cmd);
-  write_string(buf.data() + sizeof(cmd), ctx.arg.output);
+  write_string(buf.data() + sizeof(cmd), ctx.arg.final_output);
   return buf;
 }
 
@@ -265,7 +269,8 @@ static std::vector<std::vector<u8>> create_load_commands(Context<E> &ctx) {
   vec.push_back(create_dyld_info_only_cmd(ctx));
   vec.push_back(create_symtab_cmd(ctx));
   vec.push_back(create_dysymtab_cmd(ctx));
-  vec.push_back(create_uuid_cmd(ctx));
+  if (ctx.arg.uuid != UUID_NONE)
+    vec.push_back(create_uuid_cmd(ctx));
   vec.push_back(create_build_version_cmd(ctx));
   vec.push_back(create_source_version_cmd(ctx));
   vec.push_back(create_function_starts_cmd(ctx));
@@ -335,6 +340,25 @@ void OutputMachHeader<E>::copy_buf(Context<E> &ctx) {
     mhdr.flags |= MH_NO_REEXPORTED_DYLIBS;
 
   write_vector(buf + sizeof(mhdr), flatten(cmds));
+}
+
+template <typename E>
+void OutputMachHeader<E>::write_uuid(Context<E> &ctx) {
+  switch (ctx.arg.uuid) {
+  case UUID_RANDOM:
+    memcpy(ctx.uuid, get_uuid_v4().data(), 16);
+    break;
+  case UUID_HASH: {
+    u8 buf[SHA256_SIZE];
+    SHA256(ctx.buf, ctx.output_file->filesize, buf);
+    memcpy(ctx.uuid, buf, 16);
+    break;
+  }
+  default:
+    unreachable();
+  }
+
+  copy_buf(ctx);
 }
 
 template <typename E>
@@ -962,7 +986,7 @@ void IndirectSymtabSection<E>::copy_buf(Context<E> &ctx) {
 
 template <typename E>
 void CodeSignatureSection<E>::compute_size(Context<E> &ctx) {
-  std::string filename = filepath(ctx.arg.output).filename();
+  std::string filename = filepath(ctx.arg.final_output).filename();
   i64 filename_size = align_to(filename.size() + 1, 16);
   i64 num_blocks = align_to(this->hdr.offset, BLOCK_SIZE) / BLOCK_SIZE;
   this->hdr.size = sizeof(CodeSignatureHeader) + sizeof(CodeSignatureBlobIndex) +
@@ -975,7 +999,7 @@ void CodeSignatureSection<E>::write_signature(Context<E> &ctx) {
   u8 *buf = ctx.buf + this->hdr.offset;
   memset(buf, 0, this->hdr.size);
 
-  std::string filename = filepath(ctx.arg.output).filename();
+  std::string filename = filepath(ctx.arg.final_output).filename();
   i64 filename_size = align_to(filename.size() + 1, 16);
   i64 num_blocks = align_to(this->hdr.offset, BLOCK_SIZE) / BLOCK_SIZE;
 

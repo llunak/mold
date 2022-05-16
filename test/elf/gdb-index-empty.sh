@@ -13,21 +13,9 @@ cd "$(dirname "$0")"/../..
 t=out/test/elf/$testname
 mkdir -p $t
 
-cat <<EOF | $CC -fPIC -xc -c -o $t/a.o -
-void foo();
-void bar() { foo(); }
-EOF
-
-rm -f $t/b.a
-ar crs $t/b.a $t/a.o
-
-cat <<EOF | $CC -fPIC -xc -c -o $t/c.o -
-void bar();
-void foo() { bar(); }
-EOF
-
-$CC -B. -shared -o $t/d.so $t/c.o $t/b.a -Wl,-exclude-libs=ALL
-readelf --dyn-syms $t/d.so > $t/log
-fgrep -q foo $t/log
+echo 'void _start() {}' | $CC -c -o $t/a.o -xc -
+./mold -o $t/exe $t/a.o -gdb-index
+readelf -WS $t/exe > $t/log
+! fgrep -q .gdb_index $t/log || false
 
 echo OK

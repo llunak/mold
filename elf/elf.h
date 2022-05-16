@@ -64,6 +64,7 @@ static constexpr u32 SHT_PREINIT_ARRAY = 16;
 static constexpr u32 SHT_GROUP = 17;
 static constexpr u32 SHT_SYMTAB_SHNDX = 18;
 static constexpr u32 SHT_RELR = 19;
+static constexpr u32 SHT_LLVM_ADDRSIG = 0x6fff4c03;
 static constexpr u32 SHT_GNU_HASH = 0x6ffffff6;
 static constexpr u32 SHT_GNU_VERDEF = 0x6ffffffd;
 static constexpr u32 SHT_GNU_VERNEED = 0x6ffffffe;
@@ -82,6 +83,7 @@ static constexpr u32 SHF_LINK_ORDER = 0x80;
 static constexpr u32 SHF_GROUP = 0x200;
 static constexpr u32 SHF_TLS = 0x400;
 static constexpr u32 SHF_COMPRESSED = 0x800;
+static constexpr u32 SHF_GNU_RETAIN = 0x200000;
 static constexpr u32 SHF_EXCLUDE = 0x80000000;
 
 static constexpr u32 GRP_COMDAT = 1;

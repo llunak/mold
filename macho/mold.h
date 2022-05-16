@@ -88,6 +88,7 @@ public:
   i64 priority = 0;
   std::atomic_bool is_alive = false;
   bool is_dylib = false;
+  bool is_hidden = false;
   std::string archive_name;
 
 protected:
@@ -314,6 +315,7 @@ public:
 
   void compute_size(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
+  void write_uuid(Context<E> &ctx);
 };
 
 template <typename E>
@@ -759,6 +761,8 @@ void dead_strip(Context<E> &ctx);
 // main.cc
 //
 
+enum UuidKind { UUID_NONE, UUID_HASH, UUID_RANDOM };
+
 template <typename E>
 struct Context {
   Context() {
@@ -789,6 +793,7 @@ struct Context {
 
   // Command-line arguments
   struct {
+    UuidKind uuid = UUID_HASH;
     bool ObjC = false;
     bool adhoc_codesign = true;
     bool color_diagnostics = false;
@@ -800,6 +805,7 @@ struct Context {
     bool dynamic = true;
     bool fatal_warnings = false;
     bool noinhibit_exec = false;
+    bool search_paths_first = true;
     bool trace = false;
     i64 arch = CPU_TYPE_ARM64;
     i64 headerpad = 256;
@@ -807,8 +813,12 @@ struct Context {
     i64 platform = PLATFORM_MACOS;
     i64 platform_min_version = 0;
     i64 platform_sdk_version = 0;
+    i64 stack_size = 0;
     std::string chroot;
     std::string entry = "_main";
+    std::string final_output;
+    std::string install_name;
+    std::string lto_library;
     std::string map;
     std::string output = "a.out";
     std::vector<std::string> U;
@@ -821,7 +831,10 @@ struct Context {
   std::vector<std::string_view> cmdline_args;
   u32 output_type = MH_EXECUTE;
   bool all_load = false;
+  bool needed_l = false;
+  bool hidden_l = false;
 
+  u8 uuid[16] = {};
   bool has_error = false;
 
   tbb::concurrent_hash_map<std::string_view, Symbol<E>, HashCmp> symbol_map;

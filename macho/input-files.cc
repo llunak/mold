@@ -21,6 +21,7 @@ ObjectFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf,
   obj->mf = mf;
   obj->archive_name = archive_name;
   obj->is_alive = archive_name.empty() || ctx.all_load;
+  obj->is_hidden = ctx.hidden_l;
   ctx.obj_pool.emplace_back(obj);
   return obj;
 };
@@ -299,9 +300,12 @@ void ObjectFile<E>::parse_compact_unwind(Context<E> &ctx, MachSection &hdr) {
       Fatal(ctx) << *this << ": __compact_unwind: unsupported relocation: " << i;
     };
 
+    if (r.is_pcrel || r.p2size != 3 || r.type)
+      error();
+
     switch (r.offset % sizeof(CompactUnwindEntry)) {
     case offsetof(CompactUnwindEntry, code_start): {
-      if (r.is_pcrel || r.p2size != 3 || r.is_extern || r.type)
+      if (r.is_extern)
         error();
 
       Subsection<E> *target = find_subsection(ctx, src[idx].code_start);
@@ -312,12 +316,12 @@ void ObjectFile<E>::parse_compact_unwind(Context<E> &ctx, MachSection &hdr) {
       break;
     }
     case offsetof(CompactUnwindEntry, personality):
-      if (r.is_pcrel || r.p2size != 3 || !r.is_extern || r.type)
+      if (!r.is_extern)
         error();
       dst.personality = this->syms[r.idx];
       break;
     case offsetof(CompactUnwindEntry, lsda): {
-      if (r.is_pcrel || r.p2size != 3 || r.is_extern || r.type)
+      if (r.is_extern)
         error();
 
       i32 addr = *(il32 *)((u8 *)this->mf->data + hdr.offset + r.offset);
@@ -329,7 +333,7 @@ void ObjectFile<E>::parse_compact_unwind(Context<E> &ctx, MachSection &hdr) {
       break;
     }
     default:
-      Fatal(ctx) << *this << ": __compact_unwind: unsupported relocation: " << i;
+      error();
     }
   }
 
@@ -398,7 +402,7 @@ void ObjectFile<E>::resolve_symbols(Context<E> &ctx) {
 
     if (get_rank(this, msym.is_common(), false) < get_rank(sym)) {
       sym.file = this;
-      sym.is_extern = msym.ext;
+      sym.is_extern = (msym.ext && !this->is_hidden);
       sym.is_imported = false;
 
       switch (msym.type) {
@@ -518,6 +522,7 @@ template <typename E>
 DylibFile<E> *DylibFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   DylibFile<E> *dylib = new DylibFile<E>;
   dylib->mf = mf;
+  dylib->is_needed = (ctx.needed_l || !ctx.arg.dead_strip_dylibs);
   ctx.dylib_pool.emplace_back(dylib);
   return dylib;
 };
