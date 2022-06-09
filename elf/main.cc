@@ -1,6 +1,7 @@
 #include "mold.h"
 #include "../archive-file.h"
 #include "../cmdline.h"
+#include "../output-file.h"
 
 #include <cstring>
 #include <functional>
@@ -358,13 +359,6 @@ static void show_stats(Context<E> &ctx) {
     sec->print_stats(ctx);
 }
 
-static i64 get_default_thread_count() {
-  // mold doesn't scale well above 32 threads.
-  int n = tbb::global_control::active_value(
-    tbb::global_control::max_allowed_parallelism);
-  return std::min(n, 32);
-}
-
 template <typename E>
 static int elf_main(int argc, char **argv) {
   Context<E> ctx;
@@ -418,11 +412,8 @@ static int elf_main(int argc, char **argv) {
   if (ctx.arg.fork)
     on_complete = fork_child();
 
-  i64 thread_count = ctx.arg.thread_count;
-  if (thread_count == 0)
-    thread_count = get_default_thread_count();
   tbb::global_control tbb_cont(tbb::global_control::max_allowed_parallelism,
-                               thread_count);
+                               ctx.arg.thread_count);
 
   // Handle --wrap options if any.
   for (std::string_view name : ctx.arg.wrap)
@@ -560,16 +551,6 @@ static int elf_main(int argc, char **argv) {
   if (ctx.arg.shuffle_sections != SHUFFLE_SECTIONS_NONE)
     shuffle_sections(ctx);
 
-  // Compute sizes of output sections while assigning offsets
-  // within an output section to input sections.
-  compute_section_sizes(ctx);
-
-  // Sort sections by section attributes so that we'll have to
-  // create as few segments as possible.
-  sort(ctx.chunks, [&](Chunk<E> *a, Chunk<E> *b) {
-    return get_section_rank(ctx, a) < get_section_rank(ctx, b);
-  });
-
   // Copy string referred by .dynamic to .dynstr.
   for (SharedFile<E> *file : ctx.dsos)
     ctx.dynstr->add_string(file->soname);
@@ -585,6 +566,16 @@ static int elf_main(int argc, char **argv) {
   // Scan relocations to find symbols that need entries in .got, .plt,
   // .got.plt, .dynsym, .dynstr, etc.
   scan_rels(ctx);
+
+  // Compute sizes of output sections while assigning offsets
+  // within an output section to input sections.
+  compute_section_sizes(ctx);
+
+  // Sort sections by section attributes so that we'll have to
+  // create as few segments as possible.
+  sort(ctx.chunks, [&](Chunk<E> *a, Chunk<E> *b) {
+    return get_section_rank(ctx, a) < get_section_rank(ctx, b);
+  });
 
   // If --packed_dyn_relocs=relr was given, base relocations are stored
   // to a .relr.dyn section in a compressed form. Construct a compressed
@@ -643,12 +634,6 @@ static int elf_main(int argc, char **argv) {
   // Assign offsets to output sections
   i64 filesize = set_osec_offsets(ctx);
 
-  // On ARM64, we may need to create so-called "range extension thunks"
-  // to extend branch instructions reach, as they can jump only to
-  // ±128 MiB.
-  if constexpr (std::is_same_v<E, ARM64>)
-    filesize = create_range_extension_thunks(ctx);
-
   // On RISC-V, branches are encode using multiple instructions so
   // that they can jump to anywhere in ±2 GiB by default. They may
   // be replaced with shorter instruction sequences if destinations
@@ -672,7 +657,8 @@ static int elf_main(int argc, char **argv) {
   t_before_copy.stop();
 
   // Create an output file
-  ctx.output_file = OutputFile<E>::open(ctx, ctx.arg.output, filesize, 0777);
+  ctx.output_file =
+    OutputFile<Context<E>>::open(ctx, ctx.arg.output, filesize, 0777);
   ctx.buf = ctx.output_file->buf;
 
   Timer t_copy(ctx, "copy");

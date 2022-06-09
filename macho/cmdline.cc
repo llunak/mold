@@ -26,13 +26,24 @@ Options:
     -noall_load
   -arch <ARCH_NAME>           Specify target architecture
   -bundle                     Produce a mach-o bundle
+  -compatibility_version <VERSION>
+                              Specifies the compatibility version number of the library
+  -current_version <VERSION>  Specifies the current version number of the library.
   -dead_strip                 Remove unreachable functions and data
   -dead_strip_dylibs          Remove unreachable dylibs from dependencies
   -demangle                   Demangle C++ symbols in log messages (default)
   -dylib                      Produce a dynamic library
+  -dylib_compatibility_version <VERSION>
+                              Alias for -compatibility_version
+  -dylib_current_version <VERSION>
+                              Alias for -current_version
   -dynamic                    Link against dylibs (default)
   -e <SYMBOL>                 Specify the entry point of a main executable
   -execute                    Produce an executable (default)
+  -export_dynamic             Preserves all global symbols in main executables during LTO
+  -exported_symbol <SYMBOL>   Export a given symbol
+  -exported_symbols_list <FILE>
+                              Read a list of exported symbols from a given file
   -filelist <FILE>[,<DIR>]    Specify the list of input file names
   -final_output <NAME>
   -force_load <FILE>          Include all objects from a given static archive
@@ -54,17 +65,28 @@ Options:
   -no_deduplicate             Ignored
   -no_uuid                    Do not generate an LC_UUID load command
   -o <FILE>                   Set output filename
+  -object_path_lto <FILE>     Write a LTO temporary file to a given path
+  -order_file <FILE>          Ignored
   -pagezero_size <SIZE>       Specify the size of the __PAGEZERO segment
   -platform_version <PLATFORM> <MIN_VERSION> <SDK_VERSION>
                               Set platform, platform version and SDK version
   -random_uuid                Generate a random LC_UUID load command
   -rpath <PATH>               Add PATH to the runpath search path list
-  -stack_size <SIZE>
-  -syslibroot <DIR>           Prepend DIR to library search paths
-  -search_paths_first
   -search_dylibs_first
+  -search_paths_first
+  -sectcreate <SEGNAME> <SECTNAME> <FILE>
+  -stack_size <SIZE>
+  -stats                      Show statistics info
+  -syslibroot <DIR>           Prepend DIR to library search paths
   -t                          Print out each file the linker loads
-  -v                          Report version information)";
+  -thread_count <NUMBER>      Use given number of threads
+  -uexported_symbol <SYMBOL>  Export all but a given symbol
+  -unexported_symbols_list <FILE>
+                              Read a list of unexported symbols from a given file
+  -v                          Report version information
+  -weak_framework <NAME>[,<SUFFIX>]
+                              Search for a given framework
+  -weak-l<LIB>                Search for a given library)";
 
 template <typename E>
 static i64 parse_platform(Context<E> &ctx, std::string_view arg) {
@@ -112,6 +134,34 @@ static i64 parse_version(Context<E> &ctx, std::string_view arg) {
 static bool is_directory(std::filesystem::path path) {
   std::error_code ec;
   return std::filesystem::is_directory(path, ec) && !ec;
+}
+
+template <typename E>
+static std::vector<std::string>
+read_lines(Context<E> &ctx, std::string_view path) {
+  MappedFile<Context<E>> *mf =
+    MappedFile<Context<E>>::must_open(ctx, std::string(path));
+  std::string_view data((char *)mf->data, mf->size);
+
+  std::vector<std::string> vec;
+
+  while (!data.empty()) {
+    size_t pos = data.find('\n');
+    std::string_view line;
+
+    if (pos == data.npos) {
+      line = data;
+      data = "";
+    } else {
+      line = data.substr(0, pos);
+      data = data.substr(pos + 1);
+    }
+
+    line = string_trim(line);
+    if (!line.empty() && !line.starts_with('#'))
+      vec.push_back(std::string(line));
+  }
+  return vec;
 }
 
 template <typename E>
@@ -226,6 +276,12 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
         Fatal(ctx) << "unknown -arch: " << arg;
     } else if (read_flag("-bundle")) {
       ctx.output_type = MH_BUNDLE;
+    } else if (read_arg("-compatibility_version") ||
+               read_arg("-dylib_compatibility_version")) {
+      ctx.arg.compatibility_version = parse_version(ctx, arg);
+    } else if (read_arg("-current_version") ||
+               read_arg("-dylib_current_version")) {
+      ctx.arg.current_version = parse_version(ctx, arg);
     } else if (read_flag("-color-diagnostics") ||
                read_flag("--color-diagnostics")) {
       ctx.arg.color_diagnostics = true;
@@ -244,9 +300,19 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("-dynamic")) {
       ctx.arg.dynamic = true;
     } else if (read_arg("-e")) {
-      ctx.arg.entry = arg;
+      ctx.arg.entry = get_symbol(ctx, arg);
     } else if (read_flag("-execute")) {
       ctx.output_type = MH_EXECUTE;
+    } else if (read_flag("-export_dynamic")) {
+      ctx.arg.export_dynamic = true;
+    } else if (read_arg("-exported_symbol")) {
+      if (!ctx.arg.exported_symbols_list.add(arg, 1))
+        Fatal(ctx) << "-exported_symbol: invalid glob pattern: " << arg;
+    } else if (read_arg("-exported_symbols_list")) {
+      for (std::string_view pat : read_lines(ctx, arg))
+        if (!ctx.arg.exported_symbols_list.add(pat, 1))
+          Fatal(ctx) << "-exported_symbols_list: " << arg
+                     << ": invalid glob pattern: " << pat;
     } else if (read_arg("-fatal_warnings")) {
     } else if (read_arg("-filelist")) {
       remaining.push_back("-filelist");
@@ -260,6 +326,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       remaining.push_back("-framework");
       remaining.push_back(std::string(arg));
     } else if (read_arg("-lto_library")) {
+      ctx.arg.lto_library = arg;
     } else if (read_arg("-macos_version_min")) {
       ctx.arg.platform = PLATFORM_MACOS;
       ctx.arg.platform_min_version = parse_version(ctx, arg);
@@ -273,6 +340,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       remaining.push_back(std::string(arg));
     } else if (read_arg("-map")) {
       ctx.arg.map = arg;
+    } else if (read_arg("-mllvm")) {
+      ctx.arg.mllvm.push_back(std::string(arg));
     } else if (read_joined("-needed-l")) {
       remaining.push_back("-needed-l");
       remaining.push_back(std::string(arg));
@@ -284,28 +353,58 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.uuid = UUID_NONE;
     } else if (read_arg("-o")) {
       ctx.arg.output = arg;
+    } else if (read_arg("-object_path_lto")) {
+      ctx.arg.object_path_lto = arg;
+    } else if (read_arg("-order_file")) {
     } else if (read_hex("-pagezero_size")) {
       pagezero_size = hex_arg;
+    } else if (read_flag("-perf")) {
+      ctx.arg.perf = true;
     } else if (read_arg3("-platform_version")) {
       ctx.arg.platform = parse_platform(ctx, arg);
       ctx.arg.platform_min_version = parse_version(ctx, arg2);
       ctx.arg.platform_sdk_version = parse_version(ctx, arg3);
+    } else if (read_flag("-quick_exit")) {
+      ctx.arg.quick_exit = true;
+    } else if (read_flag("-no_quick_exit")) {
+      ctx.arg.quick_exit = false;
     } else if (read_flag("-random_uuid")) {
       ctx.arg.uuid = UUID_RANDOM;
     } else if (read_arg("-rpath")) {
       ctx.arg.rpath.push_back(std::string(arg));
-    } else if (read_hex("-stack_size")) {
-      ctx.arg.stack_size = hex_arg;
-    } else if (read_arg("-syslibroot")) {
-      ctx.arg.syslibroot.push_back(std::string(arg));
     } else if (read_flag("-search_paths_first")) {
       ctx.arg.search_paths_first = true;
     } else if (read_flag("-search_dylibs_first")) {
       ctx.arg.search_paths_first = false;
+    } else if (read_arg3("-sectcreate")) {
+      ctx.arg.sectcreate.push_back({arg, arg2, arg3});
+    } else if (read_hex("-stack_size")) {
+      ctx.arg.stack_size = hex_arg;
+    } else if (read_flag("-stats")) {
+      ctx.arg.stats = true;
+      Counter::enabled = true;
+    } else if (read_arg("-syslibroot")) {
+      ctx.arg.syslibroot.push_back(std::string(arg));
     } else if (read_flag("-t")) {
       ctx.arg.trace = true;
+    } else if (read_arg("-thread_count")) {
+      ctx.arg.thread_count = std::stoi(std::string(arg));
+    } else if (read_arg("-unexported_symbol")) {
+      if (!ctx.arg.unexported_symbols_list.add(arg, 1))
+        Fatal(ctx) << "-unexported_symbol: invalid glob pattern: " << arg;
+    } else if (read_arg("-unexported_symbols_list")) {
+      for (std::string_view pat : read_lines(ctx, arg))
+        if (!ctx.arg.unexported_symbols_list.add(pat, 1))
+          Fatal(ctx) << "-unexported_symbols_list: " << arg
+                     << ": invalid glob pattern: " << pat;
     } else if (read_flag("-v")) {
       SyncOut(ctx) << mold_version;
+    } else if (read_arg("-weak_framework")) {
+      remaining.push_back("-weak_framework");
+      remaining.push_back(std::string(arg));
+    } else if (read_joined("-weak-l")) {
+      remaining.push_back("-weak-l");
+      remaining.push_back(std::string(arg));
     } else {
       if (args[i][0] == '-')
         Fatal(ctx) << "unknown command line option: " << args[i];
@@ -313,6 +412,12 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       i++;
     }
   }
+
+  if (!ctx.arg.entry)
+    ctx.arg.entry = get_symbol(ctx, "_main");
+
+  if (ctx.arg.thread_count == 0)
+    ctx.arg.thread_count = get_default_thread_count();
 
   auto add_search_path = [&](std::vector<std::string> &vec, std::string path) {
     if (!path.starts_with('/') || ctx.arg.syslibroot.empty()) {
@@ -364,6 +469,12 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     else
       ctx.arg.final_output = ctx.arg.output;
   }
+
+  if (ctx.arg.uuid == UUID_RANDOM)
+    memcpy(ctx.uuid, get_uuid_v4().data(), 16);
+
+  ctx.arg.exported_symbols_list.compile();
+  ctx.arg.unexported_symbols_list.compile();
 
   return remaining;
 }

@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <bitset>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <filesystem>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <string>
@@ -24,11 +26,25 @@
 #include <unistd.h>
 #include <vector>
 
+#define XXH_INLINE_ALL 1
+#include <xxhash.h>
+
 #ifdef NDEBUG
 #  define unreachable() __builtin_unreachable()
 #else
 #  define unreachable() assert(0 && "unreachable")
 #endif
+
+class HashCmp {
+public:
+  static size_t hash(const std::string_view &k) {
+    return XXH3_64bits(k.data(), k.size());
+  }
+
+  static bool equal(const std::string_view &k1, const std::string_view &k2) {
+    return k1 == k2;
+  }
+};
 
 namespace mold {
 
@@ -59,6 +75,7 @@ extern const std::string mold_version;
 std::string_view errno_string();
 void cleanup();
 void install_signal_handler();
+i64 get_default_thread_count();
 
 //
 // Error output
@@ -237,6 +254,11 @@ inline void sort(T &vec, U less) {
   std::stable_sort(vec.begin(), vec.end(), less);
 }
 
+template <typename T>
+inline void remove_duplicates(std::vector<T> &vec) {
+  vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+}
+
 inline i64 write_string(void *buf, std::string_view str) {
   memcpy(buf, str.data(), str.size());
   *((u8 *)buf + str.size()) = '\0';
@@ -285,12 +307,11 @@ inline u64 read_uleb(u8 const*&buf) {
 }
 
 inline i64 uleb_size(u64 val) {
-  i64 i = 0;
-  do {
-    i++;
-    val >>= 7;
-  } while (val);
-  return i;
+#pragma unroll
+  for (int i = 1; i < 9; i++)
+    if (val < ((u64)1 << (7 * i)))
+      return i;
+  return 9;
 }
 
 template <typename C>
@@ -402,6 +423,30 @@ private:
 };
 
 //
+// output-file.h
+//
+
+template <typename C>
+class OutputFile {
+public:
+  static std::unique_ptr<OutputFile<C>>
+  open(C &ctx, std::string path, i64 filesize, i64 perm);
+
+  virtual void close(C &ctx) = 0;
+  virtual ~OutputFile() = default;
+
+  u8 *buf = nullptr;
+  std::string path;
+  i64 filesize;
+  bool is_mmapped;
+  bool is_unmapped = false;
+
+protected:
+  OutputFile(std::string path, i64 filesize, bool is_mmapped)
+    : path(path), filesize(filesize), is_mmapped(is_mmapped) {}
+};
+
+//
 // hyperloglog.cc
 //
 
@@ -425,6 +470,59 @@ private:
   static constexpr double ALPHA = 0.79402;
 
   std::vector<std::atomic_uint8_t> buckets;
+};
+
+//
+// glob.cc
+//
+
+class Glob {
+  typedef enum { STRING, STAR, QUESTION, BRACKET } Kind;
+
+  struct Element {
+    Element(Kind k) : kind(k) {}
+    Kind kind;
+    std::string str;
+    std::bitset<256> bitset;
+  };
+
+public:
+  static std::optional<Glob> compile(std::string_view pat);
+  bool match(std::string_view str);
+
+private:
+  Glob(std::vector<Element> &&vec) : elements(vec) {}
+  static bool do_match(std::string_view str, std::span<Element> elements);
+
+  std::vector<Element> elements;
+};
+
+//
+// multi-glob.cc
+//
+
+class MultiGlob {
+public:
+  bool add(std::string_view pat, u32 val);
+  void compile();
+  bool empty() const { return strings.empty(); }
+  std::optional<u32> find(std::string_view str);
+
+private:
+  struct TrieNode {
+    u32 value = -1;
+    TrieNode *suffix_link = nullptr;
+    std::unique_ptr<TrieNode> children[256];
+  };
+
+  void fix_suffix_links(TrieNode &node);
+  void fix_values();
+
+  std::vector<std::string> strings;
+  std::unique_ptr<TrieNode> root;
+  std::vector<std::pair<Glob, u32>> globs;
+  std::vector<u32> values;
+  bool compiled = false;
 };
 
 //

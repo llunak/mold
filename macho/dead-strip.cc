@@ -11,12 +11,12 @@ static std::vector<Subsection<E> *> collect_root_set(Context<E> &ctx) {
       rootset.push_back(sym->subsec);
   };
 
-  mark(get_symbol(ctx, ctx.arg.entry));
+  mark(ctx.arg.entry);
 
   if (ctx.output_type == MH_DYLIB || ctx.output_type == MH_BUNDLE)
     for (ObjectFile<E> *file : ctx.objs)
       for (Symbol<E> *sym : file->syms)
-        if (sym->file == file && sym->is_extern)
+        if (sym->file == file && sym->scope == SCOPE_EXTERN)
           mark(sym);
 
   return rootset;
@@ -37,11 +37,10 @@ static void visit(Context<E> &ctx, Subsection<E> &subsec) {
   }
 
   for (UnwindRecord<E> &rec : subsec.get_unwind_records()) {
-    rec.is_alive = true;
     visit(ctx, *rec.subsec);
     if (rec.lsda)
       visit(ctx, *rec.lsda);
-    if (Symbol<E> *sym = rec.personality; sym && sym->subsec)
+    if (Symbol<E> *sym = rec.personality_sym; sym && sym->subsec)
       visit(ctx, *sym->subsec);
   }
 }
@@ -62,6 +61,10 @@ static bool refers_live_subsection(Subsection<E> &subsec) {
 
 template <typename E>
 static void mark(Context<E> &ctx, const std::vector<Subsection<E> *> &rootset) {
+  for (ObjectFile<E> *file : ctx.objs)
+    for (Subsection<E> *subsec : file->subsections)
+      subsec->is_alive = false;
+
   for (Subsection<E> *subsec : rootset)
     visit(ctx, *subsec);
 
@@ -69,7 +72,7 @@ static void mark(Context<E> &ctx, const std::vector<Subsection<E> *> &rootset) {
   do {
     repeat = false;
     for (ObjectFile<E> *file : ctx.objs) {
-      for (std::unique_ptr<Subsection<E>> &subsec : file->subsections) {
+      for (Subsection<E> *subsec : file->subsections) {
         if ((subsec->isec.hdr.attr & S_ATTR_LIVE_SUPPORT) &&
             !subsec->is_alive &&
             refers_live_subsection(*subsec)) {
@@ -89,8 +92,7 @@ static void sweep(Context<E> &ctx) {
         sym = nullptr;
 
   for (ObjectFile<E> *file : ctx.objs) {
-    std::erase_if(file->subsections,
-                  [](const std::unique_ptr<Subsection<E>> &subsec) {
+    std::erase_if(file->subsections, [](const Subsection<E> *subsec) {
       return !subsec->is_alive;
     });
   }

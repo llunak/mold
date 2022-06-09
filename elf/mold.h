@@ -31,9 +31,6 @@
 #include <variant>
 #include <vector>
 
-#define XXH_INLINE_ALL 1
-#include <xxhash.h>
-
 // MOLD_DEBUG_{X86_64,ARM64}_ONLY are macros to speed up builds.
 // This should be used only for debugging. When you use this flag,
 // you need to compile mold C++ files with `-ffunction-sections
@@ -75,17 +72,6 @@ template <typename E> class RSymtabSection;
 
 template <typename E>
 std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym);
-
-class HashCmp {
-public:
-  static size_t hash(const std::string_view &k) {
-    return XXH3_64bits(k.data(), k.size());
-  }
-
-  static bool equal(const std::string_view &k1, const std::string_view &k2) {
-    return k1 == k2;
-  }
-};
 
 //
 // Mergeable section fragments
@@ -167,7 +153,7 @@ inline u64 hash_string(std::string_view str) {
 template <typename E>
 struct CieRecord {
   CieRecord(Context<E> &ctx, ObjectFile<E> &file, InputSection<E> &isec,
-            u32 input_offset, std::span<ElfRel<E>> rels, u32 rel_idx)
+            u32 input_offset, std::span<const ElfRel<E>> rels, u32 rel_idx)
     : file(file), input_section(isec), input_offset(input_offset),
       rel_idx(rel_idx), rels(rels), contents(file.get_string(ctx, isec.shdr())) {}
 
@@ -179,7 +165,7 @@ struct CieRecord {
     return contents.substr(input_offset, size());
   }
 
-  std::span<ElfRel<E>> get_rels() const {
+  std::span<const ElfRel<E>> get_rels() const {
     i64 end = rel_idx;
     while (end < rels.size() && rels[end].r_offset < input_offset + size())
       end++;
@@ -195,7 +181,7 @@ struct CieRecord {
   u32 rel_idx = -1;
   u32 icf_idx = -1;
   bool is_leader = false;
-  std::span<ElfRel<E>> rels;
+  std::span<const ElfRel<E>> rels;
   std::string_view contents;
 };
 
@@ -220,7 +206,7 @@ struct FdeRecord {
 
   i64 size(ObjectFile<E> &file) const;
   std::string_view get_contents(ObjectFile<E> &file) const;
-  std::span<ElfRel<E>> get_rels(ObjectFile<E> &file) const;
+  std::span<const ElfRel<E>> get_rels(ObjectFile<E> &file) const;
 
   u32 input_offset = -1;
   u32 output_offset = -1;
@@ -249,8 +235,6 @@ public:
   i64 offset = -1;
   std::mutex mu;
   std::vector<Symbol<ARM64> *> symbols;
-  std::vector<i32> symbol_map;
-  std::unique_ptr<std::atomic_bool[]> used;
 };
 
 struct RangeExtensionRef {
@@ -258,23 +242,20 @@ struct RangeExtensionRef {
   i32 sym_idx = -1;
 };
 
+// A struct to hold taret-dependent input section members.
 template <typename E>
-struct InputSectionExtra {
-  InputSectionExtra() = default;
+struct InputSectionExtras {};
 
-  InputSectionExtra(const InputSectionExtra &other)
-    : is_visited(other.is_visited.load()), leader(other.leader),
-      icf_idx(other.icf_idx), icf_eligible(other.icf_eligible),
-      icf_leaf(other.icf_leaf) {}
+template <>
+struct InputSectionExtras<ARM64> {
+  std::vector<RangeExtensionRef> range_extn;
+};
 
-  // For garbage collection
-  std::atomic_bool is_visited = false;
-
-  // For ICF
-  InputSection<E> *leader = nullptr;
-  u32 icf_idx = -1;
-  bool icf_eligible = false;
-  bool icf_leaf = false;
+template <>
+struct InputSectionExtras<RISCV64> {
+  std::vector<i32> r_deltas;
+  std::vector<Symbol<RISCV64> *> sorted_symbols;
+  std::vector<ElfRel<RISCV64>> sorted_rels;
 };
 
 // InputSection represents a section in an input object file.
@@ -293,25 +274,19 @@ public:
   void kill();
 
   std::string_view name() const;
-  InputSectionExtra<E> &extra() const;
   i64 get_priority() const;
   u64 get_addr() const;
   i64 get_addend(const ElfRel<E> &rel) const;
   const ElfShdr<E> &shdr() const;
-  std::span<ElfRel<E>> get_rels(Context<E> &ctx) const;
+  std::span<const ElfRel<E>> get_rels(Context<E> &ctx) const;
   std::span<FdeRecord<E>> get_fdes() const;
-
-  // For ARM64 range extension thunks
-  std::vector<RangeExtensionRef> &get_range_extn() const;
-
-  // For RISC-V section resizing
-  std::vector<i32> &get_r_deltas() const;
-  std::vector<Symbol<E> *> &get_sorted_symbols() const;
 
   ObjectFile<E> &file;
   OutputSection<E> *output_section = nullptr;
 
   std::string_view contents;
+
+  [[no_unique_address]] InputSectionExtras<E> extra;
 
   std::unique_ptr<SectionFragmentRef<E>[]> rel_fragments;
   i32 fde_begin = -1;
@@ -327,10 +302,19 @@ public:
   std::atomic_bool is_alive = true;
   u8 p2align = 0;
 
-  u8 address_significant : 1 = false;
-  u8 compressed : 1 = false;
-  u8 uncompressed : 1 = false;
-  u8 killed_by_icf : 1 = false;
+  bool address_significant : 1 = false;
+  bool compressed : 1 = false;
+  bool uncompressed : 1 = false;
+  bool killed_by_icf : 1 = false;
+
+  // For garbage collection
+  std::atomic_bool is_visited = false;
+
+  // For ICF
+  InputSection<E> *leader = nullptr;
+  u32 icf_idx = -1;
+  bool icf_eligible = false;
+  bool icf_leaf = false;
 
 private:
   typedef enum : u8 { NONE, ERROR, COPYREL, PLT, CPLT, DYNREL, BASEREL } Action;
@@ -765,7 +749,7 @@ public:
   }
 
   void construct(Context<E> &ctx);
-  void apply_reloc(Context<E> &ctx, ElfRel<E> &rel, u64 offset, u64 val);
+  void apply_reloc(Context<E> &ctx, const ElfRel<E> &rel, u64 offset, u64 val);
   void copy_buf(Context<E> &ctx) override;
 };
 
@@ -873,6 +857,20 @@ public:
   void write_buildid(Context<E> &ctx);
 
   static constexpr i64 HEADER_SIZE = 16;
+};
+
+template <typename E>
+class NotePackageSection : public Chunk<E> {
+public:
+  NotePackageSection() {
+    this->name = ".note.package";
+    this->shdr.sh_type = SHT_NOTE;
+    this->shdr.sh_flags = SHF_ALLOC;
+    this->shdr.sh_addralign = 4;
+  }
+
+  void update_shdr(Context<E> &ctx) override;
+  void copy_buf(Context<E> &ctx) override;
 };
 
 template <typename E>
@@ -1060,7 +1058,7 @@ public:
   ElfShdr<E> *find_section(i64 type);
 
   virtual void resolve_symbols(Context<E> &ctx) = 0;
-  virtual void clear_symbols();
+  void clear_symbols();
 
   virtual void
   mark_live_objects(Context<E> &ctx,
@@ -1124,7 +1122,6 @@ public:
 
   std::string archive_name;
   std::vector<std::unique_ptr<InputSection<E>>> sections;
-  std::vector<InputSectionExtra<E>> extras;
   std::vector<std::unique_ptr<MergeableSection<E>>> mergeable_sections;
   bool is_in_lib = false;
   std::vector<ElfShdr<E>> elf_sections2;
@@ -1144,14 +1141,6 @@ public:
   u64 fde_idx = 0;
   u64 fde_offset = 0;
   u64 fde_size = 0;
-
-  // For ARM64 range extension thunks
-  std::vector<std::vector<RangeExtensionRef>> range_extn;
-
-  // For RISC-V section resizing
-  std::vector<std::vector<i32>> r_deltas;
-  std::vector<std::vector<ElfRel<E>>> sorted_rels;
-  std::vector<std::vector<Symbol<E> *>> sorted_symbols;
 
   // For ICF
   InputSection<E> *llvm_addrsig = nullptr;
@@ -1243,60 +1232,6 @@ void parse_version_script(Context<E> &ctx, std::string path);
 
 template <typename E>
 void parse_dynamic_list(Context<E> &ctx, std::string path);
-
-//
-// glob.cc
-//
-
-class GlobPattern {
-  typedef enum { STRING, STAR, QUESTION, BRACKET } Kind;
-
-  struct Element {
-    Element(Kind k) : kind(k) {}
-    Kind kind;
-    std::string str;
-    std::bitset<256> bitset;
-  };
-
-public:
-  static std::optional<GlobPattern> compile(std::string_view pat);
-  bool match(std::string_view str);
-
-private:
-  GlobPattern(std::vector<Element> &&vec) : elements(vec) {}
-  static bool do_match(std::string_view str, std::span<Element> elements);
-
-  std::vector<Element> elements;
-};
-
-//
-// version-matcher.cc
-//
-
-class VersionMatcher {
-public:
-  bool add(std::string_view pat, u16 ver);
-  bool empty() const { return !root && globs.empty(); }
-  std::optional<u16> find(std::string_view str);
-
-private:
-  struct TrieNode {
-    u32 value = -1;
-    TrieNode *suffix_link = nullptr;
-    std::unique_ptr<TrieNode> children[256];
-  };
-
-  void compile();
-  void fix_suffix_links(TrieNode &node);
-  void fix_values();
-
-  std::vector<std::string> strings;
-  std::unique_ptr<TrieNode> root;
-  std::vector<std::pair<GlobPattern, u32>> globs;
-  std::vector<u16> versions;
-  std::once_flag once_flag;
-  bool compiled = false;
-};
 
 //
 // lto.cc
@@ -1399,7 +1334,7 @@ template <typename E> i64 compress_debug_sections(Context<E> &);
 template <typename E> void write_dependency_file(Context<E> &);
 
 //
-// arch-arm64.cc
+// arch-arm32.cc
 //
 
 class ThumbToArmSection : public Chunk<ARM32> {
@@ -1417,7 +1352,7 @@ public:
 
   std::vector<Symbol<ARM32> *> symbols;
 
-  static constexpr i64 ENTRY_SIZE = 8;
+  static constexpr i64 ENTRY_SIZE = 12;
 };
 
 class TlsTrampolineSection : public Chunk<ARM32> {
@@ -1439,37 +1374,13 @@ void sort_arm_exidx(Context<ARM32> &ctx);
 // arch-arm64.cc
 //
 
-i64 create_range_extension_thunks(Context<ARM64> &ctx);
+void create_range_extension_thunks(Context<ARM64> &ctx, OutputSection<ARM64> &osec);
 
 //
 // arch-riscv64.cc
 //
 
 i64 riscv_resize_sections(Context<RISCV64> &ctx);
-
-//
-// output-file.cc
-//
-
-template <typename E>
-class OutputFile {
-public:
-  static std::unique_ptr<OutputFile<E>>
-  open(Context<E> &ctx, std::string path, i64 filesize, i64 perm);
-
-  virtual void close(Context<E> &ctx) = 0;
-  virtual ~OutputFile() = default;
-
-  u8 *buf = nullptr;
-  std::string path;
-  i64 filesize;
-  bool is_mmapped;
-  bool is_unmapped = false;
-
-protected:
-  OutputFile(std::string path, i64 filesize, bool is_mmapped)
-    : path(path), filesize(filesize), is_mmapped(is_mmapped) {}
-};
 
 //
 // main.cc
@@ -1633,7 +1544,7 @@ struct Context {
     i64 print_dependencies = 0;
     i64 spare_dynamic_tags = 5;
     i64 thread_count = 0;
-    std::optional<GlobPattern> unique;
+    std::optional<Glob> unique;
     std::optional<u64> shuffle_sections_seed;
     std::string Map;
     std::string chroot;
@@ -1644,6 +1555,7 @@ struct Context {
     std::string fini = "_fini";
     std::string init = "_init";
     std::string output = "a.out";
+    std::string package_metadata;
     std::string plugin;
     std::string rpaths;
     std::string soname;
@@ -1713,8 +1625,9 @@ struct Context {
   ObjectFile<E> *internal_obj = nullptr;
 
   // Output buffer
-  std::unique_ptr<OutputFile<E>> output_file;
+  std::unique_ptr<OutputFile<Context<E>>> output_file;
   u8 *buf = nullptr;
+  bool overwrite_output_file = true;
 
   std::vector<Chunk<E> *> chunks;
   std::atomic_bool needs_tlsld = false;
@@ -1752,6 +1665,7 @@ struct Context {
   std::unique_ptr<VerneedSection<E>> verneed;
   std::unique_ptr<VerdefSection<E>> verdef;
   std::unique_ptr<BuildIdSection<E>> buildid;
+  std::unique_ptr<NotePackageSection<E>> note_package;
   std::unique_ptr<NotePropertySection<E>> note_property;
   std::unique_ptr<GdbIndexSection<E>> gdb_index;
   std::unique_ptr<ThumbToArmSection> thumb_to_arm;
@@ -1832,7 +1746,7 @@ enum {
   NEEDS_RANGE_EXTN_THUNK   = 1 << 7,
 };
 
-// A struct to hold taret-dependent symbol members;
+// A struct to hold taret-dependent symbol members.
 template <typename E>
 struct SymbolExtras {};
 
@@ -1926,10 +1840,10 @@ public:
   tbb::spin_mutex mu;
   std::atomic_uint8_t visibility = STV_DEFAULT;
 
-  u8 is_weak : 1 = false;
-  u8 write_to_symtab : 1 = false; // for --strip-all and the like
-  u8 traced : 1 = false;          // for --trace-symbol
-  u8 wrap : 1 = false;            // for --wrap
+  bool is_weak : 1 = false;
+  bool write_to_symtab : 1 = false; // for --strip-all and the like
+  bool traced : 1 = false;          // for --trace-symbol
+  bool wrap : 1 = false;            // for --wrap
 
   // If a symbol can be resolved to a symbol in a different ELF file at
   // runtime, `is_imported` is true. If a symbol is a dynamic symbol and
@@ -1952,8 +1866,8 @@ public:
   // executable. If we are creating a DSO, export-only symbols
   // represent a protected symbol (i.e. a symbol whose visibility is
   // STV_PROTECTED).
-  u8 is_imported : 1 = false;
-  u8 is_exported : 1 = false;
+  bool is_imported : 1 = false;
+  bool is_exported : 1 = false;
 
   // `is_canonical` is true if this symbol represents a "canonical" PLT.
   // Here is the explanation as to what is the canonical PLT is.
@@ -2001,7 +1915,7 @@ public:
   //
   // This bit manages if we need to make this symbol's PLT canonical.
   // This bit is meaningful only when the symbol has a PLT entry.
-  u8 is_canonical : 1 = false;
+  bool is_canonical : 1 = false;
 
   // If an input object file is not compiled with -fPIC (or with
   // -fno-PIC), the file not position independent. That means the
@@ -2032,12 +1946,12 @@ public:
   // symbol. If the original symbol in a DSO is in a read-only memory
   // region, `copyrel_readonly` is set to true so that the copied data
   // will become read-only at run-time.
-  u8 has_copyrel : 1 = false;
-  u8 copyrel_readonly : 1 = false;
+  bool has_copyrel : 1 = false;
+  bool copyrel_readonly : 1 = false;
 
   // For LTO. True if the symbol is referenced by a regular object (as
   // opposed to IR object).
-  u8 referenced_by_regular_obj : 1 = false;
+  bool referenced_by_regular_obj : 1 = false;
 
   // Target-dependent extra members.
   [[no_unique_address]] SymbolExtras<E> extra;
@@ -2083,8 +1997,9 @@ inline std::string_view FdeRecord<E>::get_contents(ObjectFile<E> &file) const {
 }
 
 template <typename E>
-inline std::span<ElfRel<E>> FdeRecord<E>::get_rels(ObjectFile<E> &file) const {
-  std::span<ElfRel<E>> rels = file.cies[cie_idx].rels;
+inline std::span<const ElfRel<E>>
+FdeRecord<E>::get_rels(ObjectFile<E> &file) const {
+  std::span<const ElfRel<E>> rels = file.cies[cie_idx].rels;
   i64 end = rel_idx;
   while (end < rels.size() && rels[end].r_offset < input_offset + size(file))
     end++;
@@ -2125,11 +2040,6 @@ inline std::string_view InputSection<E>::name() const {
 template <typename E>
 inline i64 InputSection<E>::get_priority() const {
   return ((i64)file.priority << 32) | shndx;
-}
-
-template <typename E>
-inline InputSectionExtra<E> &InputSection<E>::extra() const {
-  return file.extras[shndx];
 }
 
 template <typename E>
@@ -2243,11 +2153,12 @@ inline const ElfShdr<E> &InputSection<E>::shdr() const {
 }
 
 template <typename E>
-inline std::span<ElfRel<E>> InputSection<E>::get_rels(Context<E> &ctx) const {
+inline std::span<const ElfRel<E>> InputSection<E>::get_rels(Context<E> &ctx) const {
   if (relsec_idx == -1)
     return {};
-  if (!file.sorted_rels.empty() && !file.sorted_rels[shndx].empty())
-    return file.sorted_rels[shndx];
+  if constexpr (std::is_same_v<E, RISCV64>)
+    if (!extra.sorted_rels.empty())
+      return extra.sorted_rels;
   return file.template get_data<ElfRel<E>>(ctx, file.elf_sections[relsec_idx]);
 }
 
@@ -2257,21 +2168,6 @@ inline std::span<FdeRecord<E>> InputSection<E>::get_fdes() const {
     return {};
   std::span<FdeRecord<E>> span(file.fdes);
   return span.subspan(fde_begin, fde_end - fde_begin);
-}
-
-template <typename E>
-inline std::vector<RangeExtensionRef> &InputSection<E>::get_range_extn() const {
-  return file.range_extn[shndx];
-}
-
-template <typename E>
-inline std::vector<i32> &InputSection<E>::get_r_deltas() const {
-  return file.r_deltas[shndx];
-}
-
-template <typename E>
-inline std::vector<Symbol<E> *> &InputSection<E>::get_sorted_symbols() const {
-  return file.sorted_symbols[shndx];
 }
 
 template <typename E>
@@ -2342,7 +2238,7 @@ inline bool InputSection<E>::is_relr_reloc(Context<E> &ctx, const ElfRel<E> &rel
 
 inline u64
 RangeExtensionThunk<ARM64>::get_addr(i64 idx) const {
-  return output_section.shdr.sh_addr + offset + symbol_map[idx] * ENTRY_SIZE;
+  return output_section.shdr.sh_addr + offset + idx * ENTRY_SIZE;
 }
 
 template <typename E>
@@ -2401,14 +2297,6 @@ inline InputSection<E> *ObjectFile<E>::get_section(const ElfSym<E> &esym) {
   return sections[get_shndx(esym)].get();
 }
 
-// This operator defines a total order over symbols. This is used to
-// make the output deterministic.
-template <typename E>
-inline bool operator<(const Symbol<E> &a, const Symbol<E> &b) {
-  return std::tuple{a.file->priority, a.sym_idx} <
-         std::tuple{b.file->priority, b.sym_idx};
-}
-
 template <typename E>
 inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
   if (file && !file->is_dso) {
@@ -2440,7 +2328,7 @@ inline u64 Symbol<E>::get_addr(Context<E> &ctx, bool allow_plt) const {
   if (InputSection<E> *isec = get_input_section()) {
     if (!isec->is_alive) {
       if (isec->killed_by_icf)
-        return isec->extra().leader->get_addr() + value;
+        return isec->leader->get_addr() + value;
 
       if (isec->name() == ".eh_frame") {
         // .eh_frame contents are parsed and reconstructed by the linker,

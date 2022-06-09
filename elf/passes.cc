@@ -82,6 +82,7 @@ void create_synthetic_sections(Context<E> &ctx) {
 
   ctx.versym = push(new VersymSection<E>);
   ctx.verneed = push(new VerneedSection<E>);
+  ctx.note_package = push(new NotePackageSection<E>);
   ctx.note_property = push(new NotePropertySection<E>);
 
   if constexpr (std::is_same_v<E, ARM32>) {
@@ -550,7 +551,7 @@ R"(# This is an output of the mold linker's --print-dependencies=full option.
 
       std::unordered_set<void *> visited;
 
-      for (ElfRel<E> &r : isec->get_rels(ctx)) {
+      for (const ElfRel<E> &r : isec->get_rels(ctx)) {
         if (r.r_type == E::R_NONE)
           continue;
 
@@ -806,6 +807,11 @@ void compute_section_sizes(Context<E> &ctx) {
 
   tbb::parallel_for_each(ctx.output_sections,
                          [&](std::unique_ptr<OutputSection<E>> &osec) {
+    // This pattern will be processed in the next loop.
+    if constexpr (std::is_same_v<E, ARM64>)
+      if (osec->shdr.sh_flags & SHF_EXECINSTR)
+        return;
+
     // Since one output section may contain millions of input sections,
     // we first split input sections into groups and assign offsets to
     // groups.
@@ -845,6 +851,16 @@ void compute_section_sizes(Context<E> &ctx) {
       }
     });
   });
+
+  // On ARM64, we may need to create so-called "range extension thunks" to
+  // extend branch instructions reach, as they can jump only to ±128 MiB.
+  // In this case, we compute the sizes of sections while inserting thunks.
+  // This pass cannot be parallelized (`create_range_extension_thunks` is
+  // parallelized internally, but the function itself is not thread-safe.
+  if constexpr (std::is_same_v<E, ARM64>)
+    for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
+      if (osec->shdr.sh_flags & SHF_EXECINSTR)
+        create_range_extension_thunks(ctx, *osec);
 }
 
 template <typename E>
@@ -1048,8 +1064,8 @@ void apply_version_script(Context<E> &ctx) {
   }
 
   // Otherwise, use glob pattern matchers.
-  VersionMatcher matcher;
-  VersionMatcher cpp_matcher;
+  MultiGlob matcher;
+  MultiGlob cpp_matcher;
 
   for (VersionPattern &v : ctx.version_patterns) {
     if (v.is_cpp) {
@@ -1060,6 +1076,9 @@ void apply_version_script(Context<E> &ctx) {
         Fatal(ctx) << "invalid version pattern: " << v.pattern;
     }
   }
+
+  matcher.compile();
+  cpp_matcher.compile();
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     for (Symbol<E> *sym : file->get_global_syms()) {

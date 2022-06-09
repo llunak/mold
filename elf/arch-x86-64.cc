@@ -123,14 +123,14 @@ void PltGotSection<E>::copy_buf(Context<E> &ctx) {
   };
 
   for (Symbol<E> *sym : symbols) {
-    u8 *ent = buf + sym->get_pltgot_idx(ctx) * X86_64::pltgot_size;
+    u8 *ent = buf + sym->get_pltgot_idx(ctx) * E::pltgot_size;
     memcpy(ent, data, sizeof(data));
     *(ul32 *)(ent + 2) = sym->get_got_addr(ctx) - sym->get_plt_addr(ctx) - 6;
   }
 }
 
 template <>
-void EhFrameSection<E>::apply_reloc(Context<E> &ctx, ElfRel<E> &rel,
+void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
                                     u64 offset, u64 val) {
   u8 *loc = ctx.buf + this->shdr.sh_offset + offset;
 
@@ -233,7 +233,7 @@ static u32 relax_gotpc32_tlsdesc(u8 *loc) {
 template <>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
   ElfRel<E> *dynrel = nullptr;
-  std::span<ElfRel<E>> rels = get_rels(ctx);
+  std::span<const ElfRel<E>> rels = get_rels(ctx);
   i64 frag_idx = 0;
 
   if (ctx.reldyn)
@@ -545,7 +545,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 // scan_relocations.
 template <>
 void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
-  std::span<ElfRel<E>> rels = get_rels(ctx);
+  std::span<const ElfRel<E>> rels = get_rels(ctx);
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
@@ -655,7 +655,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
   assert(shdr().sh_flags & SHF_ALLOC);
 
   this->reldyn_offset = file.num_dynrel * sizeof(ElfRel<E>);
-  std::span<ElfRel<E>> rels = get_rels(ctx);
+  std::span<const ElfRel<E>> rels = get_rels(ctx);
 
   // Scan relocations
   for (i64 i = 0; i < rels.size(); i++) {

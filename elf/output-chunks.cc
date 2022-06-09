@@ -940,7 +940,7 @@ void OutputSection<E>::construct_relr(Context<E> &ctx) {
     if ((1 << isec.p2align) < E::word_size)
       return;
 
-    for (ElfRel<E> &r : isec.get_rels(ctx))
+    for (const ElfRel<E> &r : isec.get_rels(ctx))
       if (r.r_type == E::R_ABS && (r.r_offset % E::word_size) == 0)
         if (Symbol<E> &sym = *isec.file.symbols[r.r_sym];
             !sym.is_absolute() && !sym.is_imported)
@@ -1663,7 +1663,7 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
       std::string_view contents = cie.get_contents();
       memcpy(base + cie.output_offset, contents.data(), contents.size());
 
-      for (ElfRel<E> &rel : cie.get_rels()) {
+      for (const ElfRel<E> &rel : cie.get_rels()) {
         if (rel.r_type == E::R_NONE)
           continue;
         assert(rel.r_offset - cie.input_offset < contents.size());
@@ -1686,7 +1686,7 @@ void EhFrameSection<E>::copy_buf(Context<E> &ctx) {
       *(ul32 *)(base + offset + 4) = offset + 4 - cie.output_offset;
       bool is_first = true;
 
-      for (ElfRel<E> &rel : fde.get_rels(*file)) {
+      for (const ElfRel<E> &rel : fde.get_rels(*file)) {
         if (rel.r_type == E::R_NONE)
           continue;
 
@@ -2023,6 +2023,26 @@ void BuildIdSection<E>::write_buildid(Context<E> &ctx) {
   default:
     unreachable();
   }
+}
+
+template <typename E>
+void NotePackageSection<E>::update_shdr(Context<E> &ctx) {
+  if (!ctx.arg.package_metadata.empty()) {
+    // +17 is for the header and the NUL terminator
+    this->shdr.sh_size = align_to(ctx.arg.package_metadata.size() + 17, 4);
+  }
+}
+
+template <typename E>
+void NotePackageSection<E>::copy_buf(Context<E> &ctx) {
+  u32 *buf = (u32 *)(ctx.buf + this->shdr.sh_offset);
+  memset(buf, 0, this->shdr.sh_size);
+
+  buf[0] = 4;                                      // Name size
+  buf[1] = this->shdr.sh_size - 16;                // Content size
+  buf[2] = NT_FDO_PACKAGING_METADATA;              // Type
+  memcpy(buf + 3, "FDO", 4);                       // Name
+  write_string(buf + 4, ctx.arg.package_metadata); // Content
 }
 
 template <typename E>
@@ -2497,10 +2517,10 @@ void RelocSection<E>::copy_buf(Context<E> &ctx) {
     RelaTy *buf = (RelaTy *)(ctx.buf + this->shdr.sh_offset) + offsets[i];
 
     InputSection<E> &isec = *output_section.members[i];
-    std::span<ElfRel<E>> rels = isec.get_rels(ctx);
+    std::span<const ElfRel<E>> rels = isec.get_rels(ctx);
 
     for (i64 j = 0; j < rels.size(); j++) {
-      ElfRel<E> &r = rels[j];
+      const ElfRel<E> &r = rels[j];
       Symbol<E> &sym = *isec.file.symbols[r.r_sym];
       memset(buf + j, 0, sizeof(RelaTy));
 
@@ -2555,6 +2575,7 @@ void RelocSection<E>::copy_buf(Context<E> &ctx) {
   template class VerneedSection<E>;                                     \
   template class VerdefSection<E>;                                      \
   template class BuildIdSection<E>;                                     \
+  template class NotePackageSection<E>;                                 \
   template class NotePropertySection<E>;                                \
   template class GdbIndexSection<E>;                                    \
   template class GabiCompressedSection<E>;                              \

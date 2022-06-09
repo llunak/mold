@@ -72,11 +72,14 @@ void PltSection<E>::copy_buf(Context<E> &ctx) {
   u8 *buf = ctx.buf + this->shdr.sh_offset;
 
   static const u32 plt0[] = {
-    0xe52de004, // 1: push {lr}
-    0xe59fe004, // ldr     lr, [pc, #4]
-    0xe08fe00e, // add     lr, pc, lr
-    0xe5bef008, // ldr     pc, [lr, #8]!
-    0x00000000, // .word   .got.plt - 1b - 16
+    0xe52de004, // push {lr}
+    0xe59fe004, // ldr lr, 2f
+    0xe08fe00e, // 1: add lr, pc, lr
+    0xe5bef008, // ldr pc, [lr, #8]!
+    0x00000000, // 2: .word .got.plt - 1b - 8
+    0xe320f000, // nop
+    0xe320f000, // nop
+    0xe320f000, // nop
   };
 
   memcpy(buf, plt0, sizeof(plt0));
@@ -117,13 +120,13 @@ void PltGotSection<E>::copy_buf(Context<E> &ctx) {
 // ARM does not use .eh_frame for exception handling. Instead, it uses
 // .ARM.exidx and .ARM.extab. So this function is empty.
 template <>
-void EhFrameSection<E>::apply_reloc(Context<E> &ctx, ElfRel<E> &rel,
+void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
                                     u64 offset, u64 val) {}
 
 template <>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
   ElfRel<E> *dynrel = nullptr;
-  std::span<ElfRel<E>> rels = get_rels(ctx);
+  std::span<const ElfRel<E>> rels = get_rels(ctx);
 
   i64 frag_idx = 0;
 
@@ -302,7 +305,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
 
 template <>
 void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
-  std::span<ElfRel<E>> rels = get_rels(ctx);
+  std::span<const ElfRel<E>> rels = get_rels(ctx);
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
@@ -356,7 +359,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
   assert(shdr().sh_flags & SHF_ALLOC);
 
   this->reldyn_offset = file.num_dynrel * sizeof(ElfRel<E>);
-  std::span<ElfRel<E>> rels = get_rels(ctx);
+  std::span<const ElfRel<E>> rels = get_rels(ctx);
 
   // Scan relocations
   for (i64 i = 0; i < rels.size(); i++) {
@@ -483,10 +486,11 @@ void ThumbToArmSection::copy_buf(Context<E> &ctx) {
   u8 *buf = ctx.buf + this->shdr.sh_offset;
   i64 offset = 0;
 
-  static u16 insn[] = {
-    0x4778, // bx pc
-    0x46c0, // nop
-    0, 0,   // b <imm24>
+  static u8 insn[] = {
+    0x40, 0xf2, 0x00, 0x0c, // movw ip, $0
+    0xc0, 0xf2, 0x00, 0x0c, // movt ip, $0
+    0xfc, 0x44,             // add  ip, pc
+    0x60, 0x47,             // bx   ip
   };
 
   static_assert(sizeof(insn) == ENTRY_SIZE);
@@ -495,7 +499,8 @@ void ThumbToArmSection::copy_buf(Context<E> &ctx) {
     memcpy(buf + offset, insn, sizeof(insn));
 
     u32 val = sym->get_addr(ctx) - this->shdr.sh_addr - offset - 12;
-    *(ul32 *)(buf + offset + 4) = 0xea00'0000 | (0x00ff'ffff & (val >> 2));
+    write_thm_mov_imm(buf + offset, val);
+    write_thm_mov_imm(buf + offset + 4, val >> 16);
     offset += sizeof(insn);
   }
 }
